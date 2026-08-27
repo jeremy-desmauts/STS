@@ -1,2 +1,4 @@
 sts-test.exe
 token.txt
+*.obj
+__pycache__/

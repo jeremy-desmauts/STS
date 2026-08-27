@@ -109,7 +109,7 @@ func exchangeForFederatedToken(subjectToken, audience string) (stsTokenResponse,
 	if err := postJSON(stsTokenURL, "", reqBody, &out); err != nil {
 		return stsTokenResponse{}, fmt.Errorf("STS token exchange: %w", err)
 	}
-	log.Printf("Response token creation - %s", out)
+	log.Printf("Response token creation - %s (expires in %d seconds)", out.AccessToken, out.ExpiresIn)
 	return out, nil
 }
 
