@@ -16,7 +16,7 @@ if (-not $env:PROJECT_ID) {
 if ($Local) {
     kubectl create token $env:KSA_NAME -n $env:NAMESPACE --audience=$env:CUSTOM_AUDIENCE --duration=1h > "$PSScriptRoot\token.txt"
     $env:KSA_TOKEN_PATH = (Resolve-Path "$PSScriptRoot\token.txt").Path
-    & "C:\Program Files\Go\bin\go.exe" run "$PSScriptRoot"
+    & "C:\Program Files\Go\bin\go.exe" -C "$PSScriptRoot\go" run .
     return
 }
 

@@ -29,8 +29,9 @@ if (-not (Get-Command cl.exe -ErrorAction SilentlyContinue)) {
     }
 }
 
-cl.exe /nologo /std:c++20 /EHsc /W4 /I vendor main.cpp winhttp.lib /Fe:sts-test.exe
+cl.exe /nologo /std:c++20 /EHsc /W4 /I "$PSScriptRoot\vendor" "$PSScriptRoot\main.cpp" winhttp.lib `
+    /Fe:"$PSScriptRoot\sts-test.exe" /Fo:"$PSScriptRoot\"
 
 if ($LASTEXITCODE -eq 0) {
-    Write-Host "Built .\sts-test.exe"
+    Write-Host "Built $PSScriptRoot\sts-test.exe"
 }

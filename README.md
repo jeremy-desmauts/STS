@@ -2,11 +2,19 @@
 
 Proves out authenticating a GKE pod to GCS purely via the STS token-exchange
 API (`sts.googleapis.com`), bypassing GKE's built-in Workload Identity
-metadata-server shortcut and `google-cloud-go/storage` entirely. All calls
-are raw HTTP (see the [STS client](main.go)).
+metadata-server shortcut and any cloud SDK entirely. All calls are raw HTTP.
 
 Flow: projected KSA OIDC token → STS token exchange → federated access
 token → GCS JSON API (list / upload / download) with that token directly.
+
+The same flow is implemented three times, one per language — pick whichever
+you want to read or run:
+
+| Language | Source | Dependencies |
+|---|---|---|
+| Go (canonical — used for the Docker image / GKE pod) | [go/main.go](go/main.go) | none (standard library only) |
+| C++20 | [cpp/main.cpp](cpp/main.cpp) (build via [cpp/build.ps1](cpp/build.ps1), no CMake needed) | WinHTTP (ships with Windows) + vendored [nlohmann/json](cpp/vendor/nlohmann/json.hpp) |
+| Python 3 | [python/main.py](python/main.py) | none (standard library only) |
 
 This uses **direct resource access**: the bucket's IAM policy grants
 `roles/storage.objectAdmin` straight to the federated principal (README
@@ -76,11 +84,12 @@ anything inside the JWT.
 | KSA token — local testing (`kubectl create token ... --duration=1h`) | 1h | You, manually | Not auto-rotated; re-run the command (`.\rerun.ps1 -Local` already does this every time) |
 | Federated access token (STS exchange, stage 2) | ~1h, reported in `expires_in` on the stage 2 log line | Nobody — no refresh grant exists | Redo the whole STS exchange with a still-valid KSA token to get a new one |
 
-`main.go` is one-shot — it reads the KSA token once, exchanges it once, and
-finishes stages 3a-3c in well under a second, so none of this expiry is
-ever visible within a single run. The rotation only matters *across* runs
-(a stale `token.txt`) or if this were a long-running daemon instead of a
-one-shot test:
+Each implementation ([go/main.go](go/main.go), [cpp/main.cpp](cpp/main.cpp),
+[python/main.py](python/main.py)) is one-shot — it reads the KSA token once,
+exchanges it once, and finishes stages 3a-3c in well under a second, so none
+of this expiry is ever visible within a single run. The rotation only
+matters *across* runs (a stale `token.txt`) or if this were a long-running
+daemon instead of a one-shot test:
 
 ```mermaid
 sequenceDiagram
@@ -266,13 +275,16 @@ kubectl create serviceaccount $env:KSA_NAME -n $env:NAMESPACE --dry-run=client -
 kubectl create token $env:KSA_NAME -n $env:NAMESPACE --audience=$env:CUSTOM_AUDIENCE --duration=1h > token.txt
 ```
 
-Then run the Go program directly against that token (`env.ps1` already set
-`WORKLOAD_AUDIENCE`, `BUCKET_NAME` in your session — only `KSA_TOKEN_PATH`
-is new):
+Then run any of the three implementations directly against that token
+(`env.ps1` already set `WORKLOAD_AUDIENCE`, `BUCKET_NAME` in your session —
+only `KSA_TOKEN_PATH` is new):
 
 ```powershell
 $env:KSA_TOKEN_PATH = (Resolve-Path token.txt).Path
-go run .
+
+go -C go run .            # Go
+.\cpp\build.ps1; .\cpp\sts-test.exe   # C++20 (build.ps1 only needs to run once)
+python python/main.py    # Python 3
 ```
 
 Or run the built container image the same way, mounting the token in place

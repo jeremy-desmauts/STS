@@ -1,7 +1,7 @@
 FROM golang:1.22-alpine AS build
 WORKDIR /src
-COPY go.mod ./
-COPY main.go ./
+COPY go/go.mod ./
+COPY go/main.go ./
 RUN CGO_ENABLED=0 go build -o /sts-test .
 
 FROM gcr.io/distroless/static-debian12
