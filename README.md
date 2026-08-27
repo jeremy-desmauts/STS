@@ -3,7 +3,7 @@
 Proves out authenticating a GKE pod to GCS purely via the STS token-exchange
 API (`sts.googleapis.com`), bypassing GKE's built-in Workload Identity
 metadata-server shortcut and `google-cloud-go/storage` entirely. All calls
-are raw HTTP (see [main.go](main.go)).
+are raw HTTP (see the [STS client](main.go)).
 
 Flow: projected KSA OIDC token → STS token exchange → federated access
 token → GCS JSON API (list / upload / download) with that token directly.
@@ -37,12 +37,12 @@ flowchart TD
     Provider -- "roles/storage.objectAdmin granted directly\nto the federated principal (step 5)" --> Bucket
 ```
 
-**Runtime flow** (what `main.go` actually does each run, stage numbers match
+**Runtime flow** (what the STS client does each run, stage numbers match
 its log output):
 
 ```mermaid
 sequenceDiagram
-    participant Pod as main.go (pod)
+    participant Pod as STS client (pod)
     participant Kubelet as GKE kubelet
     participant STS as sts.googleapis.com
     participant GCS as storage.googleapis.com
@@ -86,7 +86,7 @@ one-shot test:
 sequenceDiagram
     participant Kubelet as GKE kubelet
     participant File as token file (pod's tmpfs volume)
-    participant Pod as main.go
+    participant Pod as STS client
     participant STS as sts.googleapis.com
 
     Kubelet->>File: write KSA token #1 (aud=CUSTOM_AUDIENCE, TTL=1h)
@@ -102,7 +102,7 @@ sequenceDiagram
     end
 ```
 
-What a long-running variant would need to add (nothing in `main.go` does
+What a long-running variant would need to add (nothing the STS client does
 this today, since it doesn't need to):
 - **Re-read** the KSA token file before each STS exchange instead of
   caching the value from stage 1 — cheap, and automatically picks up
@@ -232,14 +232,14 @@ kubectl logs -f sts-test -n "$env:NAMESPACE"
 
 ## Running it again
 
-`sts-test` (via the pod) and `main.go` (locally) are both safe to re-run
+`sts-test` (via the pod) and the STS client (locally) are both safe to re-run
 as many times as you like — each run just overwrites the same
 `sts-test-object.txt` in the bucket, no state accumulates. [rerun.ps1](rerun.ps1)
 wraps the two cycles below:
 
 ```powershell
 .\rerun.ps1          # delete + reapply the GKE pod, stream its logs
-.\rerun.ps1 -Local   # mint a fresh KSA token and run main.go locally
+.\rerun.ps1 -Local   # mint a fresh KSA token and run the STS client locally
 ```
 
 (A bare `kubectl apply -f k8s/pod.yaml` on its own won't rerun a finished
@@ -310,7 +310,7 @@ all stages passed
 
 - Bad/mismatched audience (pod `audience` vs. provider `--allowed-audiences`)
   → STS returns `invalid_target` with a descriptive message, surfaced verbatim
-  by `main.go`.
+  by the STS client.
 - Missing/wrong bucket IAM binding on the federated principal (step 5) → GCS
   list/upload/download calls return a 403 from `storage.googleapis.com`.
 - Wrong `subject` string in the `--member` binding (namespace/KSA name
