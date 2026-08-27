@@ -1,0 +1,53 @@
+# Example pod running the sts-test client on GKE.
+#
+# Direct resource access: the bucket's IAM policy grants
+# roles/storage.objectAdmin straight to this pod's federated principal
+# (README step 5) - no Google Service Account, no impersonation.
+#
+# Values filled in from env.ps1:
+#   PROJECT_NUMBER   579191623542
+#   POOL_ID          sts-origin-pool
+#   PROVIDER_ID      sts-jitp-provider
+#   CUSTOM_AUDIENCE  sts-jitp-audience
+#   KSA_NAME         sts-jitp-ksa
+#   BUCKET_NAME      origin-sts
+#   NAMESPACE        default
+#   image            europe-west9-docker.pkg.dev/originsolution/sts-test/sts-test:latest
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sts-jitp-ksa
+  namespace: default
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: sts-test
+  namespace: default
+spec:
+  serviceAccountName: sts-jitp-ksa
+  restartPolicy: Never
+  containers:
+    - name: sts-test
+      image: europe-west9-docker.pkg.dev/originsolution/sts-test/sts-test:latest
+      volumeMounts:
+        - name: gcp-ksa-token
+          mountPath: /var/run/secrets/tokens/gcp-ksa
+          readOnly: true
+      env:
+        - name: KSA_TOKEN_PATH
+          value: /var/run/secrets/tokens/gcp-ksa/token
+        - name: WORKLOAD_AUDIENCE
+          value: "//iam.googleapis.com/projects/579191623542/locations/global/workloadIdentityPools/sts-origin-pool/providers/sts-jitp-provider"
+        - name: BUCKET_NAME
+          value: "origin-sts"
+        - name: OBJECT_NAME
+          value: "sts-test-object.txt"
+  volumes:
+    - name: gcp-ksa-token
+      projected:
+        sources:
+          - serviceAccountToken:
+              path: token
+              audience: sts-jitp-audience
+              expirationSeconds: 3600
