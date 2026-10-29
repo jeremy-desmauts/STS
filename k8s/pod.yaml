@@ -1,18 +1,31 @@
 # Example pod running the sts-test client on GKE.
 #
-# Direct resource access: the bucket's IAM policy grants
-# roles/storage.objectAdmin straight to this pod's federated principal
-# (README step 5) - no Google Service Account, no impersonation.
+# Direct resource access: a project IAM binding, conditioned on the bucket
+# name prefix (sts-*), grants roles/storage.objectAdmin straight to this
+# pod's federated principal (README step 8) - no Google Service Account,
+# no impersonation.
+#
+# The pod also carries a *second* projected token (gcp-ksa-bootstrap-token,
+# different audience) that STS resolves to a different, narrower-scoped
+# principal - holding only a custom storage.buckets.create/.get role on
+# sts-* buckets - used solely to create BUCKET_NAME if it doesn't exist yet
+# (README "Automatic bucket creation"). Same KSA, two tokens, two IAM
+# grants that can't be used for each other's job.
 #
 # Values filled in from env.ps1:
-#   PROJECT_NUMBER   579191623542
-#   POOL_ID          sts-origin-pool
-#   PROVIDER_ID      sts-jitp-provider
-#   CUSTOM_AUDIENCE  sts-jitp-audience
-#   KSA_NAME         sts-jitp-ksa
-#   BUCKET_NAME      origin-sts
-#   NAMESPACE        default
-#   image            europe-west9-docker.pkg.dev/originsolution/sts-test/sts-test:latest
+#   PROJECT_ID                 originsolution
+#   PROJECT_NUMBER              579191623542
+#   LOCATION                    europe-west9
+#   POOL_ID                     sts-origin-pool
+#   PROVIDER_ID                 sts-jitp-provider
+#   PROVIDER_ID_BOOTSTRAP       sts-jitp-provider-bootstrap
+#   CUSTOM_AUDIENCE             sts-jitp-audience
+#   CUSTOM_AUDIENCE_BOOTSTRAP   sts-jitp-bootstrap-audience
+#   KSA_NAME                    sts-jitp-ksa
+#   BUCKET_PREFIX               sts-
+#   BUCKET_NAME                 sts-originsolution
+#   NAMESPACE                   default
+#   image                       europe-west9-docker.pkg.dev/originsolution/sts-test/sts-test:latest
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -34,15 +47,28 @@ spec:
         - name: gcp-ksa-token
           mountPath: /var/run/secrets/tokens/gcp-ksa
           readOnly: true
+        - name: gcp-ksa-bootstrap-token
+          mountPath: /var/run/secrets/tokens/gcp-ksa-bootstrap
+          readOnly: true
       env:
         - name: KSA_TOKEN_PATH
           value: /var/run/secrets/tokens/gcp-ksa/token
         - name: WORKLOAD_AUDIENCE
           value: "//iam.googleapis.com/projects/579191623542/locations/global/workloadIdentityPools/sts-origin-pool/providers/sts-jitp-provider"
+        - name: KSA_BOOTSTRAP_TOKEN_PATH
+          value: /var/run/secrets/tokens/gcp-ksa-bootstrap/token
+        - name: WORKLOAD_AUDIENCE_BOOTSTRAP
+          value: "//iam.googleapis.com/projects/579191623542/locations/global/workloadIdentityPools/sts-origin-pool/providers/sts-jitp-provider-bootstrap"
+        - name: PROJECT_ID
+          value: "originsolution"
+        - name: LOCATION
+          value: "europe-west9"
         - name: BUCKET_NAME
-          value: "origin-sts"
+          value: "sts-originsolution"
         - name: OBJECT_NAME
           value: "sts-test-object.txt"
+        - name: LIFECYCLE_FILE          # baked into the image (Dockerfile); remove to create buckets without rules
+          value: /lifecycle.json
   volumes:
     - name: gcp-ksa-token
       projected:
@@ -50,4 +76,11 @@ spec:
           - serviceAccountToken:
               path: token
               audience: sts-jitp-audience
+              expirationSeconds: 3600
+    - name: gcp-ksa-bootstrap-token
+      projected:
+        sources:
+          - serviceAccountToken:
+              path: token
+              audience: sts-jitp-bootstrap-audience
               expirationSeconds: 3600

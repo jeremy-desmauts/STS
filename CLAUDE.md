@@ -39,13 +39,14 @@ No linter or test suite is configured — this is a single-shot integration test
 
 ## Architecture
 
-Authentication flows through three stages in sequence, identically across all three implementations:
+Authentication flows through four stages in sequence, identically across all three implementations:
 
+0. **Bootstrap bucket creation** — reads a *second*, separately-audienced projected KSA token (`KSA_BOOTSTRAP_TOKEN_PATH`), exchanges it at STS for a different federated token (audience `WORKLOAD_AUDIENCE_BOOTSTRAP`), then GETs/POSTs `storage.googleapis.com/storage/v1/b` to create `BUCKET_NAME` if it doesn't exist yet
 1. **Read KSA token** — reads a projected Kubernetes ServiceAccount OIDC token from disk (`KSA_TOKEN_PATH`, default `/var/run/secrets/tokens/gcp-ksa/token`)
 2. **STS token exchange** — POSTs to `https://sts.googleapis.com/v1/token` with the KSA token, receives a short-lived GCP access token (~1h TTL). Uses `urn:ietf:params:oauth:grant-type:token-exchange` grant type.
 3. **GCS operations** — uses the federated access token as a Bearer token to List, Upload, and Download an object via the GCS JSON REST API (not any cloud SDK)
 
-The bucket IAM policy grants `roles/storage.objectAdmin` directly to the federated principal — no GSA impersonation step, no `iamcredentials.googleapis.com` calls.
+A project IAM binding conditioned on the bucket-name prefix (`BUCKET_PREFIX`, `sts-`) grants `roles/storage.objectAdmin` directly to the stage 1-3 federated principal, so it covers buckets stage 0 hasn't created yet — no GSA impersonation step, no `iamcredentials.googleapis.com` calls. The stage 0 bootstrap token is deliberately a *different* federated principal (same KSA, different token audience → different WIF provider) holding only a custom `storage.buckets.create`/`.get` role at the project level (same `sts-*` condition), so it can never touch objects and the runtime token can never create/delete a bucket. See README's "Automatic bucket creation" section.
 
 ## Key Design Decisions
 
@@ -57,9 +58,14 @@ The bucket IAM policy grants `roles/storage.objectAdmin` directly to the federat
 
 | Variable | Description |
 |---|---|
-| `KSA_TOKEN_PATH` | Path to projected OIDC token file |
-| `WORKLOAD_AUDIENCE` | Full workload identity pool+provider resource name |
-| `BUCKET_NAME` | Target GCS bucket |
+| `KSA_TOKEN_PATH` | Path to projected OIDC token file (runtime, stages 1-3) |
+| `WORKLOAD_AUDIENCE` | Full workload identity pool+provider resource name (runtime) |
+| `KSA_BOOTSTRAP_TOKEN_PATH` | Path to the second projected OIDC token file (bootstrap, stage 0) |
+| `WORKLOAD_AUDIENCE_BOOTSTRAP` | Full workload identity pool+provider resource name (bootstrap) |
+| `PROJECT_ID` | GCP project ID, needed for the stage 0 bucket-create/-check calls |
+| `LOCATION` | Bucket location (e.g. `europe-west9`), used only if stage 0 has to create the bucket |
+| `BUCKET_NAME` | Target GCS bucket — must start with `BUCKET_PREFIX` (`sts-`, set in `env.*`), or the conditioned IAM grants won't match |
 | `OBJECT_NAME` | GCS object key to test (defaults to `sts-test-object.txt`) |
+| `LIFECYCLE_FILE` | Optional. JSON lifecycle rules ([lifecycle.json](lifecycle.json)) sent with the stage 0 bucket-create request; only buckets created by stage 0 get them |
 
 See `env.sh` / `env.ps1` for how these (and the GCP/GKE setup variables) are derived.

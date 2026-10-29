@@ -1,4 +1,5 @@
 sts-test.exe
 token.txt
+token-bootstrap.txt
 *.obj
 __pycache__/

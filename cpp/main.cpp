@@ -1,6 +1,9 @@
 // Command sts-test exercises the GCP Workload Identity Federation flow by
 // hand, using nothing but WinHTTP:
 //
+//  0. Read a *second*, more narrowly-scoped projected KSA token and exchange
+//     it at STS for a "bootstrap" federated token, used only to create the
+//     target bucket if it doesn't exist yet.
 //  1. Read a projected Kubernetes ServiceAccount OIDC token (the "subject
 //     token") from disk.
 //  2. Exchange it at the STS token endpoint for a short-lived federated
@@ -10,8 +13,14 @@
 //
 // This uses "direct resource access": the bucket's IAM policy grants
 // roles/storage.objectAdmin straight to the federated principal (see
-// README step 5), so the federated token from step 2 is used as-is - no
+// README step 8), so the federated token from step 2 is used as-is - no
 // service account impersonation, no iamcredentials.googleapis.com call.
+//
+// The stage 0 bootstrap token is deliberately a *different* federated
+// principal (same KSA, different token audience -> different WIF provider,
+// see README "Automatic bucket creation") holding only a custom
+// storage.buckets.create/.get role at the project level - it can never
+// touch objects, and the stage 1-3 token can never create/delete a bucket.
 //
 // Dependencies (not in the standard library):
 //   - WinHTTP        (HTTP/TLS transport - ships with Windows, no install)
@@ -23,6 +32,7 @@
 //   cl.exe /std:c++20 /EHsc /I vendor main.cpp winhttp.lib /Fe:sts-test.exe
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdlib>
 #include <format>
@@ -67,11 +77,37 @@ void logPrintf(std::format_string<Args...> fmt, Args&&... args) {
 
 // config is read entirely from environment variables set on the pod spec.
 struct Config {
-    std::string ksaTokenPath;     // path to the projected KSA OIDC token file
-    std::string workloadAudience; // //iam.googleapis.com/projects/.../workloadIdentityPools/.../providers/...
-    std::string bucket;           // GCS bucket to exercise
-    std::string object;           // object name to upload/download during the test
+    std::string ksaTokenPath;              // path to the projected KSA OIDC token file (runtime, object ops)
+    std::string workloadAudience;          // //iam.googleapis.com/projects/.../workloadIdentityPools/.../providers/... (runtime)
+    std::string ksaBootstrapTokenPath;     // path to the second projected KSA OIDC token file (bootstrap, bucket create)
+    std::string workloadAudienceBootstrap; // same shape as workloadAudience, but for the bootstrap provider
+    std::string projectID;                 // GCP project ID, needed for the bucket-create/-check calls
+    std::string location;                  // bucket location (e.g. europe-west9), used only if the bucket needs creating
+    std::string bucket;                    // GCS bucket to exercise
+    std::string object;                    // object name to upload/download during the test
+    std::string lifecycleFile;             // optional path to the lifecycle rules applied when stage 0 creates the bucket
+    json lifecycle;                        // the "lifecycle" object read from lifecycleFile, null if unset
 };
+
+// readLifecycle loads the lifecycle rules sent with the bucket-create request.
+// The file can hold either {"lifecycle": {"rule": [...]}} - the same format
+// `gcloud storage buckets update --lifecycle-file` accepts - or just
+// {"rule": [...]}.
+json readLifecycle(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) {
+        throw std::runtime_error(std::format("reading lifecycle file {}: cannot open", path));
+    }
+    json doc;
+    try {
+        doc = json::parse(f);
+    } catch (const json::parse_error& e) {
+        throw std::runtime_error(std::format("parsing lifecycle file {}: {}", path, e.what()));
+    }
+    if (doc.contains("lifecycle")) return doc["lifecycle"];
+    if (doc.contains("rule")) return doc;
+    throw std::runtime_error(std::format("lifecycle file {} has neither a \"lifecycle\" nor a \"rule\" key", path));
+}
 
 std::string getEnvOr(const char* name, const std::string& fallback = "") {
     const char* v = std::getenv(name);
@@ -80,19 +116,27 @@ std::string getEnvOr(const char* name, const std::string& fallback = "") {
 
 Config loadConfig() {
     Config c{
-        .ksaTokenPath     = getEnvOr("KSA_TOKEN_PATH"),
-        .workloadAudience = getEnvOr("WORKLOAD_AUDIENCE"),
-        .bucket           = getEnvOr("BUCKET_NAME"),
-        .object           = getEnvOr("OBJECT_NAME"),
+        .ksaTokenPath              = getEnvOr("KSA_TOKEN_PATH"),
+        .workloadAudience          = getEnvOr("WORKLOAD_AUDIENCE"),
+        .ksaBootstrapTokenPath     = getEnvOr("KSA_BOOTSTRAP_TOKEN_PATH"),
+        .workloadAudienceBootstrap = getEnvOr("WORKLOAD_AUDIENCE_BOOTSTRAP"),
+        .projectID                 = getEnvOr("PROJECT_ID"),
+        .location                  = getEnvOr("LOCATION"),
+        .bucket                    = getEnvOr("BUCKET_NAME"),
+        .object                    = getEnvOr("OBJECT_NAME"),
     };
     if (c.object.empty()) {
         c.object = "sts-test-object.txt";
     }
 
     std::vector<std::string> missing;
-    if (c.ksaTokenPath.empty())     missing.push_back("KSA_TOKEN_PATH");
-    if (c.workloadAudience.empty()) missing.push_back("WORKLOAD_AUDIENCE");
-    if (c.bucket.empty())           missing.push_back("BUCKET_NAME");
+    if (c.ksaTokenPath.empty())              missing.push_back("KSA_TOKEN_PATH");
+    if (c.workloadAudience.empty())          missing.push_back("WORKLOAD_AUDIENCE");
+    if (c.ksaBootstrapTokenPath.empty())     missing.push_back("KSA_BOOTSTRAP_TOKEN_PATH");
+    if (c.workloadAudienceBootstrap.empty()) missing.push_back("WORKLOAD_AUDIENCE_BOOTSTRAP");
+    if (c.projectID.empty())                 missing.push_back("PROJECT_ID");
+    if (c.location.empty())                  missing.push_back("LOCATION");
+    if (c.bucket.empty())                    missing.push_back("BUCKET_NAME");
     if (!missing.empty()) {
         std::string joined;
         for (size_t i = 0; i < missing.size(); ++i) {
@@ -100,6 +144,11 @@ Config loadConfig() {
             joined += missing[i];
         }
         throw std::runtime_error(std::format("missing required env vars: [{}]", joined));
+    }
+
+    c.lifecycleFile = getEnvOr("LIFECYCLE_FILE");
+    if (!c.lifecycleFile.empty()) {
+        c.lifecycle = readLifecycle(c.lifecycleFile);
     }
     return c;
 }
@@ -315,9 +364,58 @@ std::vector<GcsObject> listObjects(const std::string& token, const std::string& 
     return items;
 }
 
+// bucketExists checks whether the bucket already exists, using the
+// bootstrap token (this needs storage.buckets.get, not storage.objectAdmin).
+bool bucketExists(const std::string& token, const std::string& projectID, const std::string& bucket) {
+    std::string path = std::format("{}/b/{}?project={}", kGcsAPIPath, bucket, projectID);
+    HttpResponse resp = httpRequest("GET", kGcsHost, path, {"Authorization: Bearer " + token});
+
+    if (resp.status == 200) return true;
+    if (resp.status == 404) return false;
+    throw std::runtime_error(std::format("checking bucket {} failed ({}): {}", bucket, resp.status, resp.body));
+}
+
+// createBucket creates the bucket, using the bootstrap token (this needs
+// storage.buckets.create, which the runtime token deliberately doesn't have).
+// Lifecycle rules, if any, are part of the same request, so setting them needs
+// no extra permission - unlike changing them later (storage.buckets.update).
+void createBucket(const std::string& token, const std::string& projectID, const std::string& bucket,
+                   const std::string& location, const json& lifecycle) {
+    std::string path = std::format("{}/b?project={}", kGcsAPIPath, projectID);
+    json reqBody = {
+        {"name", bucket},
+        {"location", location},
+        {"iamConfiguration", {{"uniformBucketLevelAccess", {{"enabled", true}}}}},
+    };
+    if (!lifecycle.is_null()) {
+        reqBody["lifecycle"] = lifecycle;
+    }
+
+    try {
+        postJSON(kGcsHost, path, token, reqBody);
+    } catch (const std::exception& e) {
+        throw std::runtime_error(std::format("creating bucket {}: {}", bucket, e.what()));
+    }
+}
+
+// Percent-encodes everything except RFC 3986 unreserved characters, so a
+// "folder/object" name goes out as "folder%2Fobject" - GCS expects the whole
+// object name as a single path segment / query value.
+std::string percentEncode(const std::string& s) {
+    std::string out;
+    for (unsigned char ch : s) {
+        if (std::isalnum(ch) || ch == '-' || ch == '_' || ch == '.' || ch == '~') {
+            out += static_cast<char>(ch);
+        } else {
+            out += std::format("%{:02X}", ch);
+        }
+    }
+    return out;
+}
+
 void uploadObject(const std::string& token, const std::string& bucket, const std::string& object,
                    const std::string& data) {
-    std::string path = std::format("{}/b/{}/o?uploadType=media&name={}", kGcsUploadPath, bucket, object);
+    std::string path = std::format("{}/b/{}/o?uploadType=media&name={}", kGcsUploadPath, bucket, percentEncode(object));
     std::vector<std::string> headers{
         "Authorization: Bearer " + token,
         "Content-Type: application/octet-stream",
@@ -330,7 +428,7 @@ void uploadObject(const std::string& token, const std::string& bucket, const std
 }
 
 std::string downloadObject(const std::string& token, const std::string& bucket, const std::string& object) {
-    std::string path = std::format("{}/b/{}/o/{}?alt=media", kGcsAPIPath, bucket, object);
+    std::string path = std::format("{}/b/{}/o/{}?alt=media", kGcsAPIPath, bucket, percentEncode(object));
     HttpResponse resp = httpRequest("GET", kGcsHost, path, {"Authorization: Bearer " + token});
 
     if (resp.status != 200) {
@@ -353,6 +451,46 @@ int main() {
         cfg = loadConfig();
     } catch (const std::exception& e) {
         fatalf(std::format("config error: {}", e.what()));
+    }
+
+    logPrintf("stage 0a: reading bootstrap subject token from {}", cfg.ksaBootstrapTokenPath);
+    std::string bootstrapSubjectToken;
+    try {
+        bootstrapSubjectToken = readSubjectToken(cfg.ksaBootstrapTokenPath);
+    } catch (const std::exception& e) {
+        fatalf(e.what());
+    }
+    logPrintf("stage 0a: OK (token length {})", bootstrapSubjectToken.size());
+
+    logPrintf("stage 0b: exchanging bootstrap subject token at STS for audience {}", cfg.workloadAudienceBootstrap);
+    StsTokenResponse bootstrapSts;
+    try {
+        bootstrapSts = exchangeForFederatedToken(bootstrapSubjectToken, cfg.workloadAudienceBootstrap);
+    } catch (const std::exception& e) {
+        fatalf(e.what());
+    }
+    logPrintf("stage 0b: OK, bootstrap token type={} expires_in={}s", bootstrapSts.tokenType, bootstrapSts.expiresIn);
+
+    logPrintf("stage 0c: checking whether gs://{} exists", cfg.bucket);
+    bool exists = false;
+    try {
+        exists = bucketExists(bootstrapSts.accessToken, cfg.projectID, cfg.bucket);
+    } catch (const std::exception& e) {
+        fatalf(e.what());
+    }
+    if (exists) {
+        logPrintf("stage 0c: OK, bucket already exists");
+    } else {
+        logPrintf("stage 0c: bucket missing, creating gs://{} in {}", cfg.bucket, cfg.location);
+        if (!cfg.lifecycle.is_null()) {
+            logPrintf("stage 0c: with lifecycle rules from {}", cfg.lifecycleFile);
+        }
+        try {
+            createBucket(bootstrapSts.accessToken, cfg.projectID, cfg.bucket, cfg.location, cfg.lifecycle);
+        } catch (const std::exception& e) {
+            fatalf(e.what());
+        }
+        logPrintf("stage 0c: OK, bucket created");
     }
 
     logPrintf("stage 1: reading subject token from {}", cfg.ksaTokenPath);

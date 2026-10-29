@@ -6,4 +6,5 @@ RUN CGO_ENABLED=0 go build -o /sts-test .
 
 FROM gcr.io/distroless/static-debian12
 COPY --from=build /sts-test /sts-test
+COPY lifecycle.json /lifecycle.json
 ENTRYPOINT ["/sts-test"]
