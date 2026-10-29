@@ -7,7 +7,9 @@ metadata-server shortcut and any cloud SDK entirely. All calls are raw HTTP.
 Flow: projected KSA OIDC token → STS token exchange → federated access
 token → GCS JSON API (list / upload / download) with that token directly.
 A second, separately-audienced token creates the bucket first if it
-doesn't exist yet — see [Automatic bucket creation](#automatic-bucket-creation).
+doesn't exist yet — see [Automatic bucket creation](#automatic-bucket-creation) —
+and gives every bucket it creates [lifecycle rules](#lifecycle-rules)
+(Coldline after 30 days, delete after 365).
 
 For the concepts without the code — token lifetimes, why there are two
 tokens, and how the `sts-*` bucket-name condition works — see
@@ -496,25 +498,6 @@ sequenceDiagram
     Note over Pod: stages 1-3 unchanged - runtime KSA token,<br/>objectAdmin on sts-* buckets (step 8)
 ```
 
-### Lifecycle rules on created buckets
-
-When `LIFECYCLE_FILE` is set, stage 0 sends the rules from that file in the
-same bucket-create request, so every bucket it creates starts with them. The
-repo's [lifecycle.json](lifecycle.json) moves objects to `COLDLINE` after 30
-days and deletes them after 365. `env.ps1` / `env.sh` point
-`LIFECYCLE_FILE` at it for local runs; the Docker image ships it as
-`/lifecycle.json` and [k8s/pod.yaml](k8s/pod.yaml) points there.
-
-- Setting rules at creation needs only `storage.buckets.create`, which the
-  bootstrap role already has. Changing them on an existing bucket needs
-  `storage.buckets.update`, which it deliberately doesn't — stage 0 never
-  modifies a bucket that already exists. For those, apply the rules by hand:
-  `gcloud storage buckets update gs://BUCKET --lifecycle-file=lifecycle.json`.
-- The file may contain `{"lifecycle": {"rule": [...]}}` (the format above,
-  also accepted by `gcloud`) or just `{"rule": [...]}`.
-- Check the result with
-  `gcloud storage buckets describe gs://BUCKET --format="json(lifecycle_config)"`.
-
 ### What this needed
 
 | Layer | Change |
@@ -529,3 +512,49 @@ stage in three codebases) than just running `gcloud storage buckets create`
 once, by hand, before Part 1. It earns its keep only because bucket
 creation needed to happen unattended, on every pod start, with nobody
 running `gcloud` first — the requirement this project started from.
+
+## Lifecycle rules
+
+Every bucket stage 0 creates starts with lifecycle rules, sent in the same
+bucket-create request. The rules live in [lifecycle.json](lifecycle.json):
+
+| After | Applies to | Action |
+|---|---|---|
+| 30 days | Objects still in `STANDARD` storage | Move to `COLDLINE` |
+| 365 days | All objects | Delete |
+
+`LIFECYCLE_FILE` tells the client where the file is. `env.ps1` / `env.sh`
+point it at the repo's `lifecycle.json` for local runs; the Docker image
+ships the file as `/lifecycle.json` and [k8s/pod.yaml](k8s/pod.yaml) points
+there (rebuild the image after editing the rules). Leave `LIFECYCLE_FILE`
+empty to create buckets without rules. When rules are applied, the log shows:
+
+```
+stage 0c: bucket missing, creating gs://sts-demo-1 in europe-west9
+stage 0c: with lifecycle rules from /lifecycle.json
+stage 0c: OK, bucket created
+```
+
+- **Only new buckets get them.** Setting rules at creation needs only
+  `storage.buckets.create`, which the bootstrap role already has. Changing
+  them on an existing bucket needs `storage.buckets.update`, which it
+  deliberately doesn't, so stage 0 never modifies a bucket that already
+  exists. Apply the rules to existing buckets by hand:
+
+  ```powershell
+  gcloud storage buckets update gs://BUCKET --lifecycle-file=lifecycle.json
+  ```
+
+- **Check what a bucket has:**
+
+  ```powershell
+  gcloud storage buckets describe gs://BUCKET --format="json(lifecycle_config)"
+  ```
+
+- **File format:** `{"lifecycle": {"rule": [...]}}` (as in the repo, and
+  also accepted by `gcloud`) or just `{"rule": [...]}`.
+- **Timing:** Google applies the rules itself, roughly once a day, so an
+  object may move or be deleted up to a day after it reaches the age.
+- **Cost:** Coldline charges for at least 90 days per object and adds a
+  per-GB fee on reads. For data that's still read often, `NEARLINE` (30-day
+  minimum) is the gentler choice.
